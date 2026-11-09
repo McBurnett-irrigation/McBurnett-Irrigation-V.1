@@ -56,7 +56,7 @@ button{cursor:pointer;font-weight:600}
 button:hover,select:hover{border-color:var(--muted)}
 :focus-visible{outline:3px solid var(--water);outline-offset:2px}
 .scroll{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--card)}
-table{border-collapse:collapse;width:100%;min-width:760px;font-variant-numeric:tabular-nums}
+table{border-collapse:collapse;width:100%;min-width:860px;font-variant-numeric:tabular-nums}
 th,td{padding:8px 12px;text-align:left;white-space:nowrap}
 th{position:sticky;top:0;background:var(--card);border-bottom:2px solid var(--line);font-size:.85rem;color:var(--muted)}
 td{border-bottom:1px solid var(--line)}
@@ -73,6 +73,7 @@ tr.run td{background:color-mix(in srgb,var(--water) 9%,transparent)}
 @media (prefers-reduced-motion:reduce){#lockdown{animation:none}}
 #recent{display:none;border:1.5px solid var(--dry);background:var(--card);border-radius:10px;padding:10px 14px;margin-bottom:16px}
 body.locked .hero .card:first-child{border:2px solid var(--lock)}
+textarea#csvBox{width:100%;font:.85rem/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:12px;white-space:pre;overflow:auto;resize:vertical}
 footer{margin-top:14px;color:var(--muted);font-size:.85rem}
 </style>
 </head>
@@ -138,9 +139,11 @@ footer{margin-top:14px;color:var(--muted);font-size:.85rem}
     <button id="csv" type="button">Download CSV</button>
   </div>
   <div class="scroll"><table>
-    <thead><tr><th>Time</th><th>Status</th><th>Moisture</th><th>mV</th><th>Pump</th><th>N</th><th>P</th><th>K</th><th>Liters</th><th>Mode</th></tr></thead>
+    <thead><tr><th>Time</th><th>Status</th><th>Moisture</th><th>mV</th><th>Pump</th><th>N</th><th>P</th><th>K</th><th>Liters</th><th>Lockouts today</th><th>Mode</th></tr></thead>
     <tbody id="tbody"></tbody>
   </table><div class="empty" id="empty" style="display:none">No readings match this filter.</div></div>
+  <div class="tools"><h2>CSV data</h2><button id="copy" type="button">Copy CSV</button></div>
+  <textarea id="csvBox" rows="8" readonly spellcheck="false" wrap="off" aria-label="CSV data for the readings shown above"></textarea>
   <footer>Checks ThingSpeak channel 3566674 every few seconds. The board uploads about every 20 s, and right after a lockout. Readings marked Demo are simulated.</footer>
 </div>
 
@@ -207,36 +210,47 @@ function localMidnightUtc(){
   const d = new Date(); d.setHours(0,0,0,0);
   return d.toISOString().slice(0,19).replace("T","%20");
 }
-function countLockouts(rows){
+function lockoutEvents(rows){
   rows = rows.slice().sort((a,b)=>a.t-b.t);
+  const out = [];
   if(rows.some(r=>r.lc !== null)){
-    let n = 0, prev = null;
+    let prev = null;
     rows.forEach(r=>{
       if(r.lc === null) return;
-      if(prev === null){ if(r.state === "LOCKOUT") n++; }
-      else n += r.lc >= prev ? r.lc - prev : r.lc;   // counter restarts at 0 if the board reboots
+      if(prev === null){ if(r.state === "LOCKOUT") out.push(r.t); }
+      else { const k = r.lc >= prev ? r.lc - prev : r.lc; for(let i=0;i<k;i++) out.push(r.t); }  // counter restarts at 0 if the board reboots
       prev = r.lc;
     });
-    return n;
+    return out;
   }
-  let n = 0, prevT = null, prevLock = false;           // fallback: count runs of LOCKOUT readings
+  let prevT = null, prevLock = false;                  // fallback: count runs of LOCKOUT readings
   rows.forEach(r=>{
     const lock = r.state === "LOCKOUT";
-    if(lock && (!prevLock || r.t - prevT > 60000)) n++;
+    if(lock && (!prevLock || r.t - prevT > 60000)) out.push(r.t);
     prevLock = lock; prevT = r.t;
   });
-  return n;
+  return out;
+}
+function countLockouts(rows){ return lockoutEvents(rows).length; }
+let todayEvents = [];
+function localMidnight(){ const d = new Date(); d.setHours(0,0,0,0); return d; }
+function statusOk(){ return lockLoaded && !(todayRows.length === 0 && data.length); }
+function lockoutsAt(d){          // running count of today's lockouts as of this reading
+  if(!statusOk() || d.t < localMidnight()) return null;
+  return todayEvents.filter(t => t <= d.t).length;
 }
 function renderLockouts(){
   const el = $("lockToday"), note = $("lockNote");
   if(!lockLoaded || (todayRows.length === 0 && data.length)){
     el.textContent = "--"; el.style.color = "";
     note.textContent = "Lockout events today (no status data yet - turn on Show Status)";
+    renderTable();
     return;
   }
-  const n = countLockouts(todayRows);
+  const n = todayEvents.length;
   el.textContent = n; el.style.color = n > 0 ? "var(--lock)" : "";
   note.textContent = "Lockout events today (since midnight)";
+  renderTable();
 }
 async function loadToday(){
   try{
@@ -246,6 +260,7 @@ async function loadToday(){
     const j = await r.json();
     todayRows = (j.feeds || []).map(f=>{ const p = parseStatus(f.status); return {t:new Date(f.created_at), state:p.state, mode:p.mode, lc:p.lc}; })
       .filter(d=>!isNaN(d.t) && d.state);
+    todayEvents = lockoutEvents(todayRows);
     lockLoaded = true;
   }catch(e){ lockLoaded = false; }
   renderLockouts();
@@ -330,21 +345,35 @@ function renderTable(){
     const [label,color] = STATES[d.state] || [d.state,"var(--muted)"];
     const cls = (d.state==="LOCKOUT"||d.state==="FAULT") ? "evt" : (d.relay ? "run" : "");
     const pct = Math.max(0,Math.min(100,d.pct||0));
+    const l = lockoutsAt(d), lt = l === null ? "--" : l;
     return `<tr class="${cls}"><td>${d.t.toLocaleString()}</td>
       <td><span class="st"><span class="dot" style="--c:${color}"></span>${label}</span></td>
       <td>${num(d.pct)}%<span class="bar"><i style="width:${pct}%"></i></span></td>
       <td>${num(d.mv)}</td><td>${d.relay?"On":"Off"}</td>
       <td>${num(d.n)}</td><td>${num(d.p)}</td><td>${num(d.k)}</td>
-      <td>${num(d.liters,2)}</td><td>${d.mode==="DEMO"?"Demo":(d.mode==="LIVE"?"Live":"")}</td></tr>`;
+      <td>${num(d.liters,2)}</td><td>${lt}</td><td>${d.mode==="DEMO"?"Demo":(d.mode==="LIVE"?"Live":"")}</td></tr>`;
   }).join("");
+  $("csvBox").value = csvText();
 }
 
+function csvText(){
+  const head = "time,status,moisture_pct,millivolts,pump_on,N,P,K,liters,lockouts_today,pump_today_s,mode";
+  const rows = filtered().map(d=>{
+    const l = lockoutsAt(d);
+    return [d.t.toISOString(),d.state,d.pct,d.mv,d.relay,d.n,d.p,d.k,d.liters,l === null ? "" : l,d.today,d.mode].join(",");
+  });
+  return head + "\n" + rows.join("\n");
+}
 function downloadCsv(){
-  const head = "time,status,moisture_pct,millivolts,pump_on,N,P,K,liters,pump_today_s,mode";
-  const rows = filtered().map(d=>[d.t.toISOString(),d.state,d.pct,d.mv,d.relay,d.n,d.p,d.k,d.liters,d.today,d.mode].join(","));
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([head+"\n"+rows.join("\n")],{type:"text/csv"}));
+  a.href = URL.createObjectURL(new Blob([csvText()],{type:"text/csv"}));
   a.download = "soil-irrigation-data.csv"; a.click();
+}
+async function copyCsv(){
+  const btn = $("copy");
+  try{ await navigator.clipboard.writeText(csvText()); }
+  catch(e){ $("csvBox").select(); document.execCommand("copy"); }
+  btn.textContent = "Copied"; setTimeout(()=>{ btn.textContent = "Copy CSV"; }, 1500);
 }
 
 async function load(){
@@ -363,6 +392,7 @@ async function load(){
 $("rows").addEventListener("change", renderTable);
 $("filter").addEventListener("change", renderTable);
 $("csv").addEventListener("click", downloadCsv);
+$("copy").addEventListener("click", copyCsv);
 $("title").textContent = CONFIG.title;
 $("snd").addEventListener("click", ()=>{ soundOn = !soundOn; syncSnd(); if(soundOn) beep(); });
 syncSnd(); drawTicks(); load(); setInterval(load, CONFIG.pollSeconds*1000);
